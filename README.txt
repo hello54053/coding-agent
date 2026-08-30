@@ -1,4 +1,4 @@
-Git仓库地址: https://github.com/username/coding-agent
+Git仓库地址: https://github.com/hello54053/coding-agent
 
 运行方式:
   1. 安装依赖: pip install openai
