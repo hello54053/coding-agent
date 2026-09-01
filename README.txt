@@ -1,7 +1,8 @@
-Git仓库地址: https://github.com/username/coding-agent
+Git仓库地址: https://github.com/hello54053/coding-agent
 
 运行方式:
   1. 安装依赖: pip install openai
+     可选:  pip install tiktoken   # 用于精确 token 计数（缺失时退化为字符估算）
   2. 配置环境变量:
      export OPENAI_API_KEY="your-api-key"
      export OPENAI_BASE_URL="your-api-base-url"
@@ -13,7 +14,11 @@ Git仓库地址: https://github.com/username/coding-agent
   - 支持执行 Shell 命令
   - 智能 view 命令自动识别文件/目录
   - 自动上下文管理与多轮对话
-  - 完善的错误处理与重试机制
+  - 流式输出（逐 token 打印，体验更佳）
+  - 多工具并行执行（OpenAI tool calling 单轮多 call 时并行调度）
+  - API 失败指数退避重试（限流/超时/网络错误自动重试）
+  - 上下文窗口管理（接近 token 上限时自动裁剪旧消息，保留 system 与最新一轮）
+  - Token 计数统计（优先 tiktoken，缺失时退化为字符估算）
 
 设计思路:
   采用 ReAct 模式实现 Agent 核心循环：
