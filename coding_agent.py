@@ -5,6 +5,8 @@
 不依赖任何 Agent 框架，纯 Python 实现核心循环。
 """
 
+import argparse
+import difflib
 import json
 import os
 import re
@@ -76,11 +78,69 @@ class ToolError(Exception):
     pass
 
 
-def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
+# -----------------------------------------------------------------------------
+# 沙箱与 diff helpers
+# -----------------------------------------------------------------------------
+def _resolve_path(path: str, workdir: Optional[str]) -> str:
+    """
+    将 path 解析到 workdir 沙箱内的绝对路径。
+    - workdir 为 None 时不沙箱化（保持向后兼容）。
+    - 相对路径以 workdir 为基；绝对路径必须落在 workdir 内。
+    - 任何试图通过 ../ 逃逸沙箱的行为都会抛 ToolError。
+    """
+    if not workdir:
+        return path
+    workdir_abs = os.path.normpath(os.path.abspath(workdir))
+    if os.path.isabs(path):
+        target = os.path.normpath(os.path.abspath(path))
+    else:
+        target = os.path.normpath(os.path.join(workdir_abs, path))
+    if target == workdir_abs or target.startswith(workdir_abs + os.sep):
+        return target
+    raise ToolError(f"路径越界（沙箱外）: {path}（工作目录: {workdir_abs}）")
+
+
+def _make_diff(old: str, new: str, path: str) -> str:
+    """生成 unified diff 字符串。"""
+    diff_lines = difflib.unified_diff(
+        old.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    )
+    return "".join(diff_lines)
+
+
+def _find_similar(original: str, old_str: str, n: int = 3) -> str:
+    """
+    在 original 中查找与 old_str 最相似的若干行（fuzzy match 提示）。
+    用 difflib 计算行级相似度，返回 top-N 候选行。
+    """
+    original_lines = original.splitlines()
+    old_lines = old_str.splitlines()
+    needle = old_lines[0] if old_lines else old_str
+    matches = difflib.get_close_matches(needle, original_lines, n=n, cutoff=0.3)
+    if not matches:
+        return ""
+    return "\n".join(f"  → {m}" for m in matches)
+
+
+def _write_to_disk(path: str, content: str) -> None:
+    """写入文件，自动创建父目录。"""
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def read_file(path: str, offset: int = 0, limit: int = 0,
+              _workdir: Optional[str] = None) -> str:
     """读取文件内容。offset 为起始行(1-based)，limit 为读取行数(0表示全部)。"""
-    if not os.path.isfile(path):
+    actual_path = _resolve_path(path, _workdir)
+    if not os.path.isfile(actual_path):
         raise ToolError(f"文件不存在: {path}")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(actual_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if offset > 0:
         lines = lines[offset - 1:]
@@ -93,76 +153,123 @@ def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
     return content
 
 
-def write_file(path: str, content: str) -> str:
-    """写入文件（覆盖）。自动创建父目录。"""
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"已写入文件: {path}"
+def write_file(path: str, content: str,
+               _workdir: Optional[str] = None,
+               _dry_run: bool = False) -> str:
+    """
+    写入文件（覆盖模式）。自动创建父目录。
+    返回值包含 unified diff，便于评审查看改动。
+    _dry_run=True 时仅计算 diff 不真正写入（供 confirm_edits 预览使用）。
+    """
+    actual_path = _resolve_path(path, _workdir)
+    old = ""
+    if os.path.isfile(actual_path):
+        with open(actual_path, "r", encoding="utf-8") as f:
+            old = f.read()
+
+    if not _dry_run:
+        _write_to_disk(actual_path, content)
+
+    diff = _make_diff(old, content, path)
+    summary = f"已写入文件: {path}"
+    if diff.strip():
+        return f"{summary}\n{diff}"
+    if old == content:
+        return f"{summary}（内容未变化）"
+    return summary
 
 
-def edit_file(path: str, old_str: str, new_str: str) -> str:
+def edit_file(path: str, old_str: str, new_str: str,
+              replace_all: bool = False,
+              _workdir: Optional[str] = None,
+              _dry_run: bool = False) -> str:
     """
     精确替换文件中的 old_str 为 new_str。
-    old_str 必须精确匹配（包括缩进和换行）。
-    如果 old_str 为空且文件不存在，则创建新文件。
+    - old_str 必须精确匹配（含缩进与换行）。
+    - replace_all=True 时替换所有出现，否则只替换第一处。
+    - 文件不存在且 old_str 为空时创建新文件。
+    - 找不到 old_str 时返回最相似的若干行作为提示（fuzzy match）。
+    - 返回值包含 unified diff。
+    - _dry_run=True 时仅计算 diff 不真正写入（供 confirm_edits 预览使用）。
     """
-    if not os.path.isfile(path):
+    actual_path = _resolve_path(path, _workdir)
+
+    # 文件不存在 + old_str 为空 -> 新建
+    if not os.path.isfile(actual_path):
         if old_str == "":
-            return write_file(path, new_str)
+            if not _dry_run:
+                _write_to_disk(actual_path, new_str)
+            diff = _make_diff("", new_str, path)
+            summary = f"已创建文件: {path}"
+            return f"{summary}\n{diff}" if diff.strip() else summary
         raise ToolError(f"文件不存在: {path}")
-    
-    with open(path, "r", encoding="utf-8") as f:
+
+    with open(actual_path, "r", encoding="utf-8") as f:
         original = f.read()
-    
+
     if old_str not in original:
-        raise ToolError(f"在文件 {path} 中未找到要替换的文本")
-    
-    new_content = original.replace(old_str, new_str, 1)  # 只替换第一次出现
-    
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    
-    return f"已编辑文件: {path}"
+        suggestions = _find_similar(original, old_str)
+        hint = f"\n\n相似行提示（精确匹配失败）：\n{suggestions}" if suggestions else ""
+        raise ToolError(f"在文件 {path} 中未找到要替换的文本{hint}")
+
+    count = original.count(old_str)
+    if replace_all:
+        new_content = original.replace(old_str, new_str)
+    else:
+        new_content = original.replace(old_str, new_str, 1)
+        count = 1
+
+    if not _dry_run:
+        _write_to_disk(actual_path, new_content)
+
+    diff = _make_diff(original, new_content, path)
+    summary = f"已编辑文件: {path}（替换 {count} 处）"
+    return f"{summary}\n{diff}" if diff.strip() else f"{summary}（内容未变化）"
 
 
-def list_files(path: str = ".", depth: int = 2) -> str:
+def list_files(path: str = ".", depth: int = 2,
+               _workdir: Optional[str] = None) -> str:
     """列出目录内容。depth 控制递归深度。"""
-    if not os.path.isdir(path):
+    actual_path = _resolve_path(path, _workdir)
+    if not os.path.isdir(actual_path):
         raise ToolError(f"目录不存在: {path}")
-    
+
     result = []
     prefix = "  "
-    
-    for root, dirs, files in os.walk(path):
+
+    for root, dirs, files in os.walk(actual_path):
         # 控制深度
-        current_depth = root.count(os.sep) - path.count(os.sep)
+        current_depth = root.count(os.sep) - actual_path.count(os.sep)
         if current_depth > depth:
             del dirs[:]
             continue
-        
+
         # 跳过隐藏目录
         dirs[:] = [d for d in dirs if not d.startswith(".")]
-        
+
         indent = prefix * current_depth
-        rel_root = os.path.relpath(root, path) if current_depth > 0 else "."
+        rel_root = os.path.relpath(root, actual_path) if current_depth > 0 else "."
         if current_depth > 0:
             result.append(f"{indent}{os.path.basename(root)}/")
-        
+
         file_indent = prefix * (current_depth + 1)
         for f in sorted(files):
             if f.startswith("."):
                 continue
             result.append(f"{file_indent}{f}")
-    
+
     return "\n".join(result) if result else "(空目录)"
 
 
-def execute_command(command: str, timeout: int = 30) -> str:
+def execute_command(command: str, timeout: int = 30,
+                    _workdir: Optional[str] = None) -> str:
     """
     执行 shell 命令。
-    注意：在不受信任的环境中应限制命令范围，此处为编程任务简化处理。
+    - cwd 默认为当前工作目录；若启用了沙箱（_workdir），则 cwd 改为沙箱根目录。
+    - 注意：shell 命令本身的内容无法被沙箱限制（如 cd /、绝对路径等），
+      这里仅在 cwd 层面做隔离，主要用于"在项目根目录执行"的语义。
     """
+    cwd = _workdir if _workdir else os.getcwd()
     try:
         result = subprocess.run(
             command,
@@ -170,7 +277,7 @@ def execute_command(command: str, timeout: int = 30) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=os.getcwd(),
+            cwd=cwd,
         )
         output = ""
         if result.stdout:
@@ -185,12 +292,13 @@ def execute_command(command: str, timeout: int = 30) -> str:
         raise ToolError(f"命令执行失败: {str(e)}")
 
 
-def view(path: str) -> str:
+def view(path: str, _workdir: Optional[str] = None) -> str:
     """智能查看：文件则读取，目录则列出。"""
-    if os.path.isfile(path):
-        return read_file(path)
-    elif os.path.isdir(path):
-        return list_files(path)
+    actual_path = _resolve_path(path, _workdir)
+    if os.path.isfile(actual_path):
+        return read_file(path, _workdir=_workdir)
+    elif os.path.isdir(actual_path):
+        return list_files(path, _workdir=_workdir)
     else:
         raise ToolError(f"路径不存在: {path}")
 
@@ -206,7 +314,7 @@ TOOLS: Dict[str, Callable] = {
 }
 
 
-# 工具 schema（发送给模型的定义）
+# 工具 schema（发送给模型的定义；_workdir/_dry_run 等隐藏参数不暴露给模型）
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -242,7 +350,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "写入文件（覆盖模式）。如果文件已存在会被完全覆盖。自动创建父目录。",
+            "description": "写入文件（覆盖模式）。如果文件已存在会被完全覆盖。自动创建父目录。返回值含 unified diff。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -257,13 +365,19 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "精确编辑文件：将 old_str 替换为 new_str。old_str 必须精确匹配原文（含缩进）。如果文件不存在且 old_str 为空，则创建新文件。",
+            "description": (
+                "精确编辑文件：将 old_str 替换为 new_str。old_str 必须精确匹配原文（含缩进与换行）。"
+                "replace_all=True 时替换所有出现，否则只替换第一处。"
+                "如果文件不存在且 old_str 为空，则创建新文件。"
+                "找不到 old_str 时会返回最相似的若干行作为提示。返回值含 unified diff。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "old_str": {"type": "string", "description": "要替换的原文，必须精确匹配"},
-                    "new_str": {"type": "string", "description": "新内容"}
+                    "new_str": {"type": "string", "description": "新内容"},
+                    "replace_all": {"type": "boolean", "description": "是否替换所有匹配（默认 false，仅替换第一处）"}
                 },
                 "required": ["path", "old_str", "new_str"]
             }
@@ -288,7 +402,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "execute_command",
-            "description": "执行 shell 命令。用于运行代码、安装依赖、执行测试、git 操作等。timeout 默认30秒。",
+            "description": "执行 shell 命令。用于运行代码、安装依赖、执行测试、git 操作等。timeout 默认30秒。命令在沙箱根目录（若启用）下执行。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -319,6 +433,9 @@ class AgentConfig:
     parallel_tools: bool = True           # 是否并行执行多个工具调用
     max_retries: int = 3                  # API 调用失败最大重试次数
     retry_base_delay: float = 1.0         # 重试退避基础延迟（秒）
+    workdir: Optional[str] = None         # 工作目录沙箱根（None 表示不沙箱化）
+    confirm_edits: bool = False           # 编辑文件前是否需要人工二次确认
+    stats_enabled: bool = True            # 是否在每轮任务结束时打印统计
 
 
 class CodingAgent:
@@ -342,31 +459,67 @@ class CodingAgent:
 
 重要规则：
 - 每次编辑文件前，先读取文件确认内容
-- 使用 edit_file 时，old_str 必须精确匹配原文（包括缩进和换行）
+- 使用 edit_file 时，old_str 必须精确匹配原文（包括缩进和换行）；如果相似但不完全匹配，工具会返回最相似的几行作为提示
+- edit_file 默认只替换第一处；若需要替换全部相同文本，传 replace_all=true
+- 文件路径默认相对于工作目录（沙箱根），不要尝试用 ../ 访问沙箱外文件
 - 执行命令后，根据返回码和输出判断成功或失败
 - 如果任务已完成，直接回复用户，不要继续调用工具
 - 保持简洁，不要输出与任务无关的内容
 - 回答用户关于当前目录的问题前，先用 list_files 或 view 确认实际文件状态
 - 不要依赖对话历史中的文件列表，因为用户可能在外部手动修改了文件
+- 大胆尝试：每次 edit_file/write_file 都会自动保存修改前的状态到备份栈，
+  用户可以用 undo 命令随时回滚你的修改，所以可以放心重构复杂函数
+- 当前运行环境是 Windows，执行命令时请使用 Windows CMD 语法：
+  - 查看当前目录：用 `cd`（不带参数）而不是 `pwd`
+  - 列出文件：用 `dir` 而不是 `ls`
+  - 路径分隔符用 `\` 或 `/`（两者都支持）
 """
-    
+
     def __init__(self, config: Optional[AgentConfig] = None):
         self.config = config or AgentConfig()
         self.client = OpenAI(
-            api_key=self.config.api_key or os.getenv("DASHSCOPE_API_KEY"), 
+            api_key=self.config.api_key or os.getenv("DASHSCOPE_API_KEY"),
             base_url=self.config.base_url or os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         )
         self.messages: List[Dict[str, Any]] = []
+        # 沙箱根目录：解析为绝对路径并确保存在
+        self.workdir: Optional[str] = self._init_workdir(self.config.workdir)
+        # 本轮统计（每次 run() 开始时重置）
+        self.stats: Dict[str, Any] = self._fresh_stats()
+        # 编辑历史备份栈：每次 edit_file/write_file 执行前 push (actual_path, old_content)
+        # 撤销时弹出栈顶并恢复；old_content="" 表示原文件不存在（撤销时删除新建文件）
+        self.backups: List[tuple] = []
+
+    @staticmethod
+    def _init_workdir(workdir: Optional[str]) -> Optional[str]:
+        """初始化沙箱根目录；返回绝对路径或 None。"""
+        if not workdir:
+            return None
+        wd = os.path.abspath(workdir)
+        os.makedirs(wd, exist_ok=True)
+        return wd
+
+    @staticmethod
+    def _fresh_stats() -> Dict[str, Any]:
+        return {
+            "steps": 0,
+            "tool_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "start_time": 0.0,
+            "estimated": False,  # 是否为本地估算（提供方未返回 usage）
+        }
     
     def _call_model_with_retry(self, stream: bool = False):
         """
         带指数退避重试的模型调用。
         对限流、超时、网络错误进行重试；其它 API 错误也尝试重试。
+        流式模式下请求 stream_options 让服务端在最后 chunk 返回 usage。
         """
         last_err: Optional[Exception] = None
         for attempt in range(self.config.max_retries + 1):
             try:
-                return self.client.chat.completions.create(
+                kwargs: Dict[str, Any] = dict(
                     model=self.config.model,
                     messages=self.messages,
                     tools=TOOL_SCHEMAS,
@@ -375,6 +528,10 @@ class CodingAgent:
                     temperature=0.2,  # 低温度使工具调用更稳定
                     stream=stream,
                 )
+                if stream:
+                    # 请求服务端在流末尾返回 usage 统计
+                    kwargs["stream_options"] = {"include_usage": True}
+                return self.client.chat.completions.create(**kwargs)
             except (RateLimitError, APITimeoutError, APIConnectionError) as e:
                 last_err = e
                 if attempt < self.config.max_retries:
@@ -396,22 +553,60 @@ class CodingAgent:
         assert last_err is not None
         raise last_err
 
+    def _accumulate_usage(self, usage: Any) -> None:
+        """把 response.usage / chunk.usage 累积到 self.stats。"""
+        if not usage:
+            return
+        try:
+            self.stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            self.stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+        except Exception:
+            pass
+
+    def _estimate_usage_fallback(self, completion_text: str = "") -> None:
+        """
+        提供方未返回 usage 时的 fallback 估算：
+        - prompt_tokens 用 count_message_tokens(self.messages) 估算本次输入
+        - completion_tokens 用 count_tokens(completion_text) 估算本次输出
+        注：self.messages 是当前累积的全部历史，每步会重复计算，
+        所以估算出的 prompt_tokens 偏大，仅作为 token=0 时的兜底。
+        """
+        self.stats["estimated"] = True
+        self.stats["prompt_tokens"] += count_message_tokens(
+            self.messages, self.config.model)
+        if completion_text:
+            self.stats["completion_tokens"] += count_tokens(
+                completion_text, self.config.model)
+
     def _call_model(self) -> Any:
         """
         调用模型，返回响应消息对象（SimpleNamespace 或原 message）。
         支持流式输出（逐 token 打印文本）与流式 tool_calls 累积。
+        同时累积 usage（prompt/completion tokens）到 self.stats；
+        若提供方未返回 usage，则用本地 token 计数估算。
         """
         if not self.config.stream:
             response = self._call_model_with_retry(stream=False)
-            return response.choices[0].message
+            usage = getattr(response, "usage", None)
+            self._accumulate_usage(usage)
+            msg = response.choices[0].message
+            # 提供 fallback 估算（仅当本次未拿到 usage）
+            if not usage:
+                self._estimate_usage_fallback(msg.content or "")
+            return msg
 
         # 流式：边接收边打印文本，并累积 tool_calls
         response = self._call_model_with_retry(stream=True)
         content_buf = ""
         tool_calls_buf: Dict[int, Dict[str, Any]] = {}
         printed_prefix = False
+        got_usage = False
 
         for chunk in response:
+            # 流末尾的 usage chunk（部分提供方在最后单独发一个 chunk）
+            if hasattr(chunk, "usage") and chunk.usage:
+                self._accumulate_usage(chunk.usage)
+                got_usage = True
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -445,6 +640,10 @@ class CodingAgent:
         if printed_prefix and content_buf and not content_buf.endswith("\n"):
             print()
 
+        # 提供 fallback 估算（仅当流式未返回 usage）
+        if not got_usage:
+            self._estimate_usage_fallback(content_buf)
+
         tool_calls_list = [
             SimpleNamespace(
                 id=tc["id"] or f"call_{i}",
@@ -465,8 +664,12 @@ class CodingAgent:
         """
         执行单个工具调用。
         返回符合 OpenAI tool 角色的消息字典。
-        注意：本方法只负责执行与结果构造，不做日志打印（日志由 run() 统一控制），
-        以便在并行执行时输出顺序清晰。
+        注意：
+        - 本方法不做调用/结果日志（日志由 run() 统一控制），
+          以便并行执行时输出顺序清晰。
+        - 通过隐藏参数 _workdir 把沙箱根目录注入到工具函数（不暴露给模型）。
+        - 若 config.confirm_edits=True，对 edit_file/write_file 做二次确认：
+          先 dry-run 拿到 diff 预览，询问 y/N，确认后才真正写入。
         """
         tool_id = tool_call.id
         function_name = tool_call.function.name
@@ -486,7 +689,57 @@ class CodingAgent:
                 "tool_call_id": tool_id,
                 "content": f"错误: 未知工具 '{function_name}'",
             }
-        
+
+        # 注入沙箱根目录（隐藏参数，模型看不到）
+        arguments["_workdir"] = self.workdir
+
+        # 编辑类工具的二次确认
+        if self.config.confirm_edits and function_name in ("edit_file", "write_file"):
+            try:
+                preview_args = dict(arguments)
+                preview_args["_dry_run"] = True
+                preview = func(**preview_args)
+                print(f"  🔍 即将修改 {arguments.get('path')}，预览：")
+                # 只打印前 30 行 diff，避免输出过长
+                preview_lines = preview.splitlines()
+                print("\n".join(preview_lines[:30])
+                      + ("..." if len(preview_lines) > 30 else ""))
+                try:
+                    ans = input("  ❓ 确认修改? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+                if ans != "y":
+                    return {
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": "用户取消了修改",
+                    }
+            except ToolError as e:
+                # dry-run 阶段就出错（如文件不存在），直接返回错误
+                return {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": f"工具执行错误: {e}",
+                }
+
+        # 编辑类工具：执行前先把原文件内容压入备份栈，便于 undo 回滚
+        # 备份的是 actual_path 与原内容（文件不存在则记为空串，撤销时删除）
+        backed_up = False
+        if function_name in ("edit_file", "write_file"):
+            try:
+                actual_path = _resolve_path(arguments.get("path", ""), self.workdir)
+                if os.path.isfile(actual_path):
+                    with open(actual_path, "r", encoding="utf-8") as f:
+                        old_content = f.read()
+                    self.backups.append((actual_path, old_content))
+                else:
+                    # 原文件不存在（新建场景），撤销时删除该文件
+                    self.backups.append((actual_path, ""))
+                backed_up = True
+            except Exception:
+                # 备份失败不阻塞工具执行，只是无法撤销
+                pass
+
         try:
             result = func(**arguments)
             return {
@@ -495,6 +748,9 @@ class CodingAgent:
                 "content": str(result),
             }
         except ToolError as e:
+            # 工具失败，刚才的备份没意义，弹出
+            if backed_up:
+                self.backups.pop()
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
@@ -502,12 +758,49 @@ class CodingAgent:
             }
         except Exception as e:
             # 捕获所有未预期异常，防止 Agent 崩溃
+            if backed_up:
+                self.backups.pop()
             err_msg = f"内部错误: {str(e)}\n{traceback.format_exc()}"
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "content": err_msg,
             }
+
+    def undo_last_edit(self) -> str:
+        """
+        撤销最近一次 edit_file/write_file 修改，把文件恢复到修改前的状态。
+        - 若原文件不存在（old_content 为空）则删除新创建的文件
+        - 若原文件存在则用备份内容覆盖回去
+        - 备份栈为空时返回提示
+        """
+        if not self.backups:
+            return "没有可撤销的修改（备份栈为空）"
+        actual_path, old_content = self.backups.pop()
+        if old_content == "":
+            # 原文件不存在，撤销 = 删除新建的文件
+            if os.path.isfile(actual_path):
+                try:
+                    os.remove(actual_path)
+                    return f"✅ 已撤销：删除了新建文件 {actual_path}"
+                except Exception as e:
+                    return f"⚠️ 撤销失败（删除 {actual_path} 时出错: {e}）"
+            return f"⚠️ 无可撤销内容：{actual_path} 已不存在"
+        # 恢复原内容
+        try:
+            _write_to_disk(actual_path, old_content)
+            return f"✅ 已撤销：{actual_path} 已恢复到上次编辑前"
+        except Exception as e:
+            return f"⚠️ 撤销失败（恢复 {actual_path} 时出错: {e}）"
+
+    def show_backups(self) -> str:
+        """查看当前备份栈。"""
+        if not self.backups:
+            return "备份栈为空"
+        lines = ["备份栈（栈顶在上，最近修改在前）："]
+        for i, (path, _) in enumerate(reversed(self.backups), 1):
+            lines.append(f"  {i}. {path}")
+        return "\n".join(lines)
     
     def _trim_context_if_needed(self) -> None:
         """
@@ -556,8 +849,21 @@ class CodingAgent:
     def run(self, user_input: str) -> str:
         """
         执行一轮用户任务。
-        返回最终回复文本。
+        返回最终回复文本。无论正常返回或异常，结束都打印统计。
         """
+        # 重置本轮统计
+        self.stats = self._fresh_stats()
+        self.stats["start_time"] = time.perf_counter()
+
+        result = ""
+        try:
+            result = self._run_loop(user_input)
+        finally:
+            self._print_stats()
+        return result
+
+    def _run_loop(self, user_input: str) -> str:
+        """实际的核心循环。"""
         # 初始化对话（仅首次）
         if not self.messages:
             self.messages.append({"role": "system", "content": self.SYSTEM_PROMPT})
@@ -567,6 +873,7 @@ class CodingAgent:
         print(f"\n👤 用户: {user_input}")
 
         for step in range(self.config.max_steps):
+            self.stats["steps"] += 1
             # 调用模型前裁剪上下文
             self._trim_context_if_needed()
             # 调用模型
@@ -607,6 +914,7 @@ class CodingAgent:
             # 执行工具调用（多工具时并行）
             tool_calls = response_msg.tool_calls
             n = len(tool_calls)
+            self.stats["tool_calls"] += n
             tool_results: List[Dict[str, Any]] = [None] * n  # type: ignore[list-item]
             if self.config.parallel_tools and n > 1:
                 with ThreadPoolExecutor(max_workers=min(4, n)) as ex:
@@ -632,6 +940,28 @@ class CodingAgent:
         msg = "达到最大步数限制，任务未完成。"
         print(f"\n🤖 Agent: {msg}")
         return msg
+
+    def _print_stats(self) -> None:
+        """打印本轮统计信息。"""
+        if not self.config.stats_enabled:
+            return
+        elapsed = time.perf_counter() - self.stats["start_time"]
+        pt = self.stats["prompt_tokens"]
+        ct = self.stats["completion_tokens"]
+        estimated = self.stats["estimated"]
+        print("\n" + "=" * 60)
+        print("📊 本轮统计")
+        print("=" * 60)
+        print(f"  推理步数:          {self.stats['steps']}")
+        print(f"  工具调用:          {self.stats['tool_calls']} 次")
+        suffix = " (本地估算，prompt 偏大)" if estimated else ""
+        print(f"  prompt tokens:     {pt}{suffix}")
+        print(f"  completion tokens: {ct}{suffix}")
+        print(f"  总 tokens:          {pt + ct}")
+        print(f"  耗时:              {elapsed:.2f}s")
+        if pt + ct == 0:
+            print("  （token 数为 0：可能本地计数器也失效）")
+        print("=" * 60)
     
     def reset(self):
         """清空对话历史，开始新会话。"""
@@ -687,27 +1017,69 @@ class CodingAgent:
 # =============================================================================
 
 def main():
-    print("=" * 50)
+    parser = argparse.ArgumentParser(
+        description="编程智能体 (Coding Agent)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "环境变量:\n"
+            "  OPENAI_API_KEY   API 密钥（也可设 DASHSCOPE_API_KEY 作为兜底）\n"
+            "  OPENAI_BASE_URL  API 网关地址\n"
+            "  AGENT_MODEL      模型名称（默认 qwen3.8-27b）\n"
+            "\n"
+            "示例:\n"
+            "  python coding_agent.py --workdir ./project\n"
+            "  python coding_agent.py --workdir ./project --confirm-edits\n"
+            "  python coding_agent.py --no-stats --no-stream\n"
+        ),
+    )
+    parser.add_argument("--workdir", default=None,
+                        help="工作目录沙箱根；Agent 的所有文件操作被限制在该目录下，"
+                             "execute_command 的 cwd 也会切到该目录")
+    parser.add_argument("--confirm-edits", action="store_true",
+                        help="编辑文件（edit_file/write_file）前需要人工 y/N 二次确认")
+    parser.add_argument("--no-stats", action="store_true",
+                        help="禁用每轮任务结束时的统计输出")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="禁用流式输出（默认开启）")
+    parser.add_argument("--no-parallel", action="store_true",
+                        help="禁用多工具并行执行（默认开启）")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="单轮任务最大步数（默认 30）")
+    args = parser.parse_args()
+
+    print("=" * 60)
     print("  编程智能体 (Coding Agent)")
     print("  输入 'exit' 退出 | 'reset' 重置对话 | 'history' 查看历史")
-    print("=" * 50)
-    
-    # 从环境变量读取配置，也可硬编码测试
+    print("  输入 'undo' 撤销上次编辑 | 'backups' 查看备份栈")
+    if args.workdir:
+        print(f"  工作目录沙箱: {os.path.abspath(args.workdir)}")
+    if args.confirm_edits:
+        print("  编辑二次确认: 已启用")
+    print("=" * 60)
+
+    # 从环境变量 + 命令行参数共同构造配置
     config = AgentConfig(
         model=os.getenv("AGENT_MODEL", "qwen3.8-27b"),
         base_url=os.getenv("OPENAI_BASE_URL"),
         api_key=os.getenv("OPENAI_API_KEY"),
+        workdir=args.workdir,
+        confirm_edits=args.confirm_edits,
+        stats_enabled=not args.no_stats,
+        stream=not args.no_stream,
+        parallel_tools=not args.no_parallel,
     )
-    
+    if args.max_steps is not None:
+        config.max_steps = args.max_steps
+
     agent = CodingAgent(config)
-    
+
     while True:
         try:
             user_input = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
             break
-        
+
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit"):
@@ -719,7 +1091,13 @@ def main():
         if user_input.lower() == "history":
             agent.show_history()
             continue
-        
+        if user_input.lower() == "undo":
+            print(agent.undo_last_edit())
+            continue
+        if user_input.lower() in ("backups", "backup"):
+            print(agent.show_backups())
+            continue
+
         try:
             agent.run(user_input)
         except Exception as e:
