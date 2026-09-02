@@ -1,19 +1,19 @@
 Git仓库地址: https://github.com/hello54053/coding-agent
 
-运行方式:
+运行方式：
   1. 安装依赖: pip install openai
      可选:  pip install tiktoken   # 用于精确 token 计数（缺失时退化为字符估算）
-  2. 配置环境变量:
+  2. 配置环境变量：
      export OPENAI_API_KEY="your-api-key"
      export OPENAI_BASE_URL="your-api-base-url"
      export AGENT_MODEL="model-name"
-  3. 运行:
+  3. 运行：
      python coding_agent.py                              # 默认模式
      python coding_agent.py --workdir ./project         # 启用工作目录沙箱
      python coding_agent.py --workdir ./project --confirm-edits   # 沙箱 + 编辑二次确认
      python coding_agent.py --help                       # 查看全部命令行参数
 
-  命令行参数:
+  命令行参数：
      --workdir DIR          工作目录沙箱根；所有文件操作被限制在该目录下
      --confirm-edits        编辑文件（edit_file/write_file）前需要人工 y/N 二次确认
      --no-stats             禁用每轮任务结束时的统计输出
@@ -21,17 +21,17 @@ Git仓库地址: https://github.com/hello54053/coding-agent
      --no-parallel          禁用多工具并行执行
      --max-steps N          单轮任务最大步数（默认 30）
 
-  交互式命令（运行中输入）:
+  交互式命令（运行中输入）：
      undo     撤销最近一次 edit_file/write_file，把文件恢复到修改前
      backups  查看当前备份栈（栈顶=最近一次编辑）
      reset    清空对话历史
      history  查看对话历史
      exit     退出
 
-  自检脚本（不消耗 API 额度）:
+  自检脚本（不消耗 API 额度）：
      python verify_improvements.py
 
-特色功能:
+特色功能：
   - 支持文件读写、精确编辑、目录浏览
   - 支持执行 Shell 命令
   - 智能 view 命令自动识别文件/目录
@@ -47,7 +47,7 @@ Git仓库地址: https://github.com/hello54053/coding-agent
   - 编辑二次确认模式（--confirm-edits）：dry-run 生成 diff 预览后人工 y/N
   - 编辑前自动备份到栈，支持 undo 命令一键回滚（大胆尝试：放心让 Agent 重构复杂函数）
 
-设计思路:
+设计思路：
   采用 ReAct 模式实现 Agent 核心循环：
   1. 用户输入追加到对话历史
   2. 调用 LLM，模型决定是否调用工具
@@ -59,7 +59,7 @@ Git仓库地址: https://github.com/hello54053/coding-agent
   所有文件工具调用 _resolve_path 解析路径；execute_command 的 cwd 切到沙箱根。
   注：shell 命令内容本身无法被沙箱限制（如 cd /），仅在 cwd 层面做隔离。
 
-工具列表:
+工具列表：
   - view:          智能查看文件或目录
   - read_file:     读取文件（支持 offset/limit）
   - write_file:    写入文件（返回值含 unified diff）
