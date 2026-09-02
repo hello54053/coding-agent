@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -480,6 +481,7 @@ class CodingAgent:
         self.client = OpenAI(
             api_key=self.config.api_key or os.getenv("DASHSCOPE_API_KEY"),
             base_url=self.config.base_url or os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            timeout=60.0,  # 60秒超时
         )
         self.messages: List[Dict[str, Any]] = []
         # 沙箱根目录：解析为绝对路径并确保存在
@@ -489,6 +491,9 @@ class CodingAgent:
         # 编辑历史备份栈：每次 edit_file/write_file 执行前 push (actual_path, old_content)
         # 撤销时弹出栈顶并恢复；old_content="" 表示原文件不存在（撤销时删除新建文件）
         self.backups: List[tuple] = []
+        # 思考动画：调用模型期间在后台线程播放旋转动画，提示用户模型正在响应
+        self._thinking_stop: Optional[threading.Event] = None
+        self._thinking_thread: Optional[threading.Thread] = None
 
     @staticmethod
     def _init_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -509,7 +514,55 @@ class CodingAgent:
             "start_time": 0.0,
             "estimated": False,  # 是否为本地估算（提供方未返回 usage）
         }
-    
+
+    # -------------------------------------------------------------------------
+    # 思考动画：调用模型期间在后台线程播放旋转动画，让用户知道模型在响应
+    # -------------------------------------------------------------------------
+    def _start_thinking(self, hint: str = "思考中") -> None:
+        """
+        启动后台线程播放思考动画。
+        若已有动画在跑则不重复启动（重试恢复场景会先停后启）。
+        """
+        if self._thinking_thread and self._thinking_thread.is_alive():
+            return
+        # 根据 stdout 编码选择动画字符：UTF-8 终端用盲文+emoji，其它（如 GBK）退化为 ASCII
+        # 否则非 UTF-8 终端下动画线程会因 UnicodeEncodeError 静默崩溃，用户看不到反馈
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "")
+        if enc == "utf8":
+            spinner, icon = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "🤔 "
+        else:
+            spinner, icon = "|/-\\", ""
+        self._thinking_stop = threading.Event()
+        self._thinking_thread = threading.Thread(
+            target=self._thinking_animation,
+            args=(hint, self._thinking_stop, spinner, icon),
+            daemon=True,
+        )
+        self._thinking_thread.start()
+
+    def _stop_thinking(self) -> None:
+        """停止思考动画并清除当前行残留字符。"""
+        if self._thinking_stop is not None:
+            self._thinking_stop.set()
+            self._thinking_stop = None
+        if self._thinking_thread is not None and self._thinking_thread.is_alive():
+            self._thinking_thread.join(timeout=1.0)
+        self._thinking_thread = None
+        # 用空格覆盖动画占用的当前行后回到行首，避免残留字符污染后续输出
+        print("\r" + " " * 60 + "\r", end="", flush=True)
+
+    @staticmethod
+    def _thinking_animation(hint: str, stop_event: threading.Event,
+                            spinner: str, icon: str) -> None:
+        """后台动画线程主体：循环打印旋转字符，直到收到停止信号。"""
+        i = 0
+        while not stop_event.is_set():
+            frame = spinner[i % len(spinner)]
+            print(f"\r{icon}{hint} {frame}   ", end="", flush=True)
+            i += 1
+            # 用 wait 而非 sleep，便于收到停止信号后快速退出
+            stop_event.wait(0.1)
+
     def _call_model_with_retry(self, stream: bool = False):
         """
         带指数退避重试的模型调用。
@@ -536,18 +589,22 @@ class CodingAgent:
                 last_err = e
                 if attempt < self.config.max_retries:
                     delay = self.config.retry_base_delay * (2 ** attempt)
+                    self._stop_thinking()
                     print(f"\n⚠️ API 调用失败 ({type(e).__name__})，"
                           f"{delay:.1f}s 后重试 ({attempt + 1}/{self.config.max_retries})...")
                     time.sleep(delay)
+                    self._start_thinking()
                     continue
                 raise
             except APIError as e:
                 last_err = e
                 if attempt < self.config.max_retries:
                     delay = self.config.retry_base_delay * (2 ** attempt)
+                    self._stop_thinking()
                     print(f"\n⚠️ API 错误 ({type(e).__name__}: {e})，"
                           f"{delay:.1f}s 后重试 ({attempt + 1}/{self.config.max_retries})...")
                     time.sleep(delay)
+                    self._start_thinking()
                     continue
                 raise
         assert last_err is not None
@@ -586,7 +643,11 @@ class CodingAgent:
         若提供方未返回 usage，则用本地 token 计数估算。
         """
         if not self.config.stream:
-            response = self._call_model_with_retry(stream=False)
+            self._start_thinking()
+            try:
+                response = self._call_model_with_retry(stream=False)
+            finally:
+                self._stop_thinking()
             usage = getattr(response, "usage", None)
             self._accumulate_usage(usage)
             msg = response.choices[0].message
@@ -596,10 +657,17 @@ class CodingAgent:
             return msg
 
         # 流式：边接收边打印文本，并累积 tool_calls
-        response = self._call_model_with_retry(stream=True)
+        self._start_thinking()
+        try:
+            response = self._call_model_with_retry(stream=True)
+        except Exception:
+            self._stop_thinking()
+            raise
+
         content_buf = ""
         tool_calls_buf: Dict[int, Dict[str, Any]] = {}
         printed_prefix = False
+        animation_stopped = False
         got_usage = False
 
         for chunk in response:
@@ -611,12 +679,20 @@ class CodingAgent:
                 continue
             delta = chunk.choices[0].delta
             if delta.content:
+                # 收到首个文本 token 时停止思考动画，开始打印回复
+                if not animation_stopped:
+                    self._stop_thinking()
+                    animation_stopped = True
                 if not printed_prefix:
                     print("\n🤖 Agent: ", end="", flush=True)
                     printed_prefix = True
                 print(delta.content, end="", flush=True)
                 content_buf += delta.content
             if delta.tool_calls:
+                # 收到首个 tool_call 时也停止动画（模型可能不输出文本直接调用工具）
+                if not animation_stopped:
+                    self._stop_thinking()
+                    animation_stopped = True
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index if tc_delta.index is not None else 0
                     if idx not in tool_calls_buf:
@@ -635,6 +711,10 @@ class CodingAgent:
                             tool_calls_buf[idx]["function"]["arguments"] += fn.arguments
             if chunk.choices[0].finish_reason:
                 break
+
+        # 兜底停止动画（模型可能只返回 usage chunk 或直接 finish 而无 content/tool_calls）
+        if not animation_stopped:
+            self._stop_thinking()
 
         # 若输出了文本，补一个换行（便于后续工具日志另起一行）
         if printed_prefix and content_buf and not content_buf.endswith("\n"):
